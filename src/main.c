@@ -10,7 +10,12 @@
 #include <stdlib.h>
 #include <math.h>
 #include <mpi.h>
-#include "debug.h"
+#include "sparse.h"
+#include "mmio/mmio.h"
+
+#define USE_LAPACK_FORMAT
+
+extern int mm_read(const char *fname, double **__val, int **__I, int **__J, int *_nz, int *_dim1, int *_dim2);
 
 int main(int argc, char *argv[]){
 
@@ -20,14 +25,66 @@ int main(int argc, char *argv[]){
 	int index1,index2;
 	int mynode, totalnodes;
 	double alpha,gamma;
-	const int numrows = 5;
 	MPI_Status status;
 	MPI_Init(&argc,&argv);
 	MPI_Comm_size(MPI_COMM_WORLD, &totalnodes);
 	MPI_Comm_rank(MPI_COMM_WORLD, &mynode);
 	size = (int) pow(2,log2(totalnodes+1)+1)-1;
+	double **A;
 
-	double **A = (double **)malloc(numrows * sizeof(double *));
+    if (argc < 2) {
+		printf("Usage: %s [martix-market-filename]\n", argv[0]);
+		exit(1);
+	}
+
+	int numactivep = totalnodes;
+	int * activep = (int *)malloc(totalnodes * sizeof(int));
+
+#if 1
+    int bw = 3;
+	int kl, ku;
+	kl = ku = (bw-2); /* assume symmetric matrix */
+
+	sparsematrix_t smat;
+
+	if(mynode == 0) {
+
+		/* Read matrix */
+		if (mm_read(argv[1], &smat.val, &smat.colidx, &smat.rowidx, &smat.nnz, &smat.ncol, &smat.nrow)) {
+			printf("MM read error !!!\n");
+			exit(1);
+		}
+
+		/* Memory allocation */
+		A = (double **)malloc(smat.nrow * sizeof(double *));
+		if(A == NULL) {
+			fprintf(stderr, "out of memory\n");
+			return -1;
+		}
+
+		for(i = 0; i < smat.nrow; i++) {
+			A[i] = (double *)calloc(bw + 1, sizeof(double));
+			A[i][bw] = 1.0;	/* XXX: right size is all one vector */
+			if(A[i] == NULL) {
+				fprintf(stderr, "out of memory\n");
+				return -1;
+			}
+		}
+
+
+		/* Convert to LAPACK Band format */
+		for (i = 0; i < smat.nnz; i++) {
+			A[smat.rowidx[i]][kl + smat.colidx[i] - smat.rowidx[i]] = smat.val[i];
+		}
+
+	}
+
+	int numrows = smat.nrow;
+
+#else
+	const int numrows = 5;
+
+	A = (double **)malloc(numrows * sizeof(double *));
 
 	for(i=0;i<numrows;i++){
 		A[i] = (double *)malloc((size+1) * sizeof(double));
@@ -59,14 +116,14 @@ int main(int argc, char *argv[]){
 	for(i=0;i<3;i++)
 		A[i][size] = 2*mynode+i;
 
-	int numactivep = totalnodes;
-	int * activep = (int *)malloc(totalnodes * sizeof(int));
-	for(j=0;j<numactivep;j++)
-	activep[j] = j;
 	for(j=0;j<size+1;j++){
 		A[3][j] = A[0][j];
 		A[4][j] = A[2][j];
 	}
+#endif
+
+	for(j=0;j<numactivep;j++)
+		activep[j] = j;
 
 	/*
 	Remark 1: Just as in the parallel Gaussian elimination code, we augment the matrix A
@@ -76,17 +133,22 @@ int main(int argc, char *argv[]){
 	*/
 
 	/* Part 2 - Cyclic reduction */
+#ifdef USE_LAPACK_FORMAT
+#	define CONV_COLIDX(row_idx, col_idx)	(kl+col_idx-row_idx)
+#else
+#	define CONV_COLIDX(row_idx, col_idx)	(col_idx)
+#endif
 
 	for(i=0;i<log2(size+1)-1;i++){
 		for(j=0;j<numactivep;j++){
 			if(mynode==activep[j]){
 				index1 = 2*mynode + 1 - pow(2,i);
 				index2 = 2*mynode + 1 + pow(2,i);
-				alpha = A[1][index1]/A[3][index1];
-				gamma = A[1][index2]/A[4][index2];
+				alpha = A[1][CONV_COLIDX(1,index1)]/A[3][CONV_COLIDX(3,index1)];
+				gamma = A[1][CONV_COLIDX(1,index2)]/A[4][CONV_COLIDX(4,index2)];
 
 				for(k=0;k<size+1;k++)
-					A[1][k] -= (alpha*A[3][k] + gamma*A[4][k]);
+					A[1][CONV_COLIDX(1,k)] -= (alpha*A[3][CONV_COLIDX(3,k)] + gamma*A[4][CONV_COLIDX(4,k)]);
 
 				if(numactivep>1){
 					if(j==0) {
@@ -123,7 +185,7 @@ int main(int argc, char *argv[]){
 	for(j=0;j<totalnodes;j++)
 	x[j] = 0.0;
 	if(mynode==activep[0]){
-		x[mynode] = A[1][size]/A[1][(size-1)/2];
+		x[mynode] = A[1][CONV_COLIDX(1,size)]/A[1][CONV_COLIDX(1,(size-1)/2)];
 	}
 	double tmp;
 	for(i=log2(size+1)-3;i>=0;i--){
@@ -135,12 +197,12 @@ int main(int argc, char *argv[]){
 		}
 		for(j=0;j<numactivep;j++){
 			if(mynode == activep[j]){
-				x[mynode] = A[1][size];
+				x[mynode] = A[1][CONV_COLIDX(1,size)];
 				for(k=0;k<totalnodes;k++){
 					if(k!=mynode)
-						x[mynode] -= A[1][2*k+1]*x[k];
+						x[mynode] -= A[1][CONV_COLIDX(1,2*k+1)]*x[k];
 				}
-				x[mynode] = x[mynode]/A[1][2*mynode+1];
+				x[mynode] = x[mynode]/A[1][CONV_COLIDX(1,2*mynode+1)];
 			}
 		}
 	}
@@ -153,28 +215,29 @@ int main(int argc, char *argv[]){
 	found the solution for its row and has communicated that information to the appropriate
 	processors, it is no longer active. This can be observed in figure 9.12 - observe that processor
 	P 3 no longer has things to compute in the second and third levels.
-	Remark 4: We use the MP I Allgather command so that at any given level all the proces-
-	sors have the available solution up to that point. This all inclusive communication could be
-	replaced by MP I Send/MP I Recv pairs where only those processors requiring particular
+	/*
+	Remark 4: We use the MPI_Allgather command so that at any given level all the processors have
+	the available solution up to that point. This all inclusive communication could be
+	replaced by MPI_Send/MPI_Recv pairs where only those processors requiring particular
 	information would be updated.
 	*/
 
 	/* Part 4 - Solving for odd rows */
 	for(k=0;k<totalnodes;k++){
-		A[0][size] -= A[0][2*k+1]*x[k];
-		A[2][size] -= A[2][2*k+1]*x[k];
+		A[0][CONV_COLIDX(0,size)] -= A[0][CONV_COLIDX(0,2*k+1)]*x[k];
+		A[2][CONV_COLIDX(2,size)] -= A[2][CONV_COLIDX(2,2*k+1)]*x[k];
 	}
-	A[0][size] = A[0][size]/A[0][2*mynode];
-	A[1][size] = x[mynode];
-	A[2][size] = A[2][size]/A[2][2*mynode+2];
+	A[0][CONV_COLIDX(0,size)] = A[0][CONV_COLIDX(0,size)]/A[0][CONV_COLIDX(0,2*mynode)];
+	A[1][CONV_COLIDX(1,size)] = x[mynode];
+	A[2][CONV_COLIDX(2,size)] = A[2][CONV_COLIDX(2,size)]/A[2][CONV_COLIDX(2,2*mynode+2)];
 	free(activep);
+
 	for(i=0;i<numrows;i++)
 		free(A[i]);
+
 	free(A);
 	free(x);
 	MPI_Finalize();
-
-	dbg_printf("Completed successfully");
 
 	return 0;
 }
