@@ -12,6 +12,8 @@
 #include <mpi.h>
 #include "sparse.h"
 #include "mmio/mmio.h"
+#include "string.h"
+#include "debug.h"
 
 #define USE_LAPACK_FORMAT
 
@@ -26,11 +28,12 @@ int main(int argc, char *argv[]){
 	int mynode, totalnodes;
 	double alpha,gamma;
 	MPI_Status status;
+	MPI_Request req;
 	MPI_Init(&argc,&argv);
 	MPI_Comm_size(MPI_COMM_WORLD, &totalnodes);
 	MPI_Comm_rank(MPI_COMM_WORLD, &mynode);
 	size = (int) pow(2,log2(totalnodes+1)+1)-1;
-	double **A;
+
 
     if (argc < 2) {
 		printf("Usage: %s [martix-market-filename]\n", argv[0]);
@@ -46,6 +49,8 @@ int main(int argc, char *argv[]){
 	kl = ku = (bw-2); /* assume symmetric matrix */
 
 	sparsematrix_t smat;
+	int numrows = 5;
+	double **Mat;
 
 	if(mynode == 0) {
 
@@ -56,30 +61,73 @@ int main(int argc, char *argv[]){
 		}
 
 		/* Memory allocation */
-		A = (double **)malloc(smat.nrow * sizeof(double *));
-		if(A == NULL) {
+		Mat = (double **)malloc(smat.nrow * sizeof(double *));
+		if(Mat == NULL) {
 			fprintf(stderr, "out of memory\n");
 			return -1;
 		}
 
 		for(i = 0; i < smat.nrow; i++) {
-			A[i] = (double *)calloc(bw + 1, sizeof(double));
-			A[i][bw] = 1.0;	/* XXX: right size is all one vector */
-			if(A[i] == NULL) {
+			Mat[i] = (double *)calloc(bw + 1, sizeof(double));
+			Mat[i][bw] = 1.0;	/* XXX: right hand side is all one vector */
+			if(Mat[i] == NULL) {
 				fprintf(stderr, "out of memory\n");
 				return -1;
 			}
 		}
 
-
 		/* Convert to LAPACK Band format */
 		for (i = 0; i < smat.nnz; i++) {
-			A[smat.rowidx[i]][kl + smat.colidx[i] - smat.rowidx[i]] = smat.val[i];
+			Mat[smat.rowidx[i]][kl + smat.colidx[i] - smat.rowidx[i]] = smat.val[i];
 		}
-
 	}
 
-	int numrows = smat.nrow;
+	double **A;
+	A = (double **)malloc(numrows * sizeof(double *));
+	if(A == NULL) {
+		fprintf(stderr, "out of memory @ node %d\n", mynode);
+		return -1;
+	}
+
+	for(i = 0; i < numrows; i++) {
+		A[i] = (double *)malloc((bw + 1) * sizeof(double));
+		if(A[i] == NULL) {
+			fprintf(stderr, "out of memory\n");
+			return -1;
+		}
+	}
+
+	int xmitlen = (bw + 1);
+
+	/* Row partitioning */
+	if(mynode == 0) {
+		for (i = 1; i < totalnodes; i++) {
+			MPI_Isend(Mat[2*i    ], xmitlen, MPI_DOUBLE, i, 0, MPI_COMM_WORLD, &req);
+			MPI_Isend(Mat[2*i + 1], xmitlen, MPI_DOUBLE, i, 0, MPI_COMM_WORLD, &req);
+			MPI_Isend(Mat[2*i + 2], xmitlen, MPI_DOUBLE, i, 0, MPI_COMM_WORLD, &req);
+		}
+		memcpy((void *)A[0], (void *)Mat[0], xmitlen * sizeof(double));
+		memcpy((void *)A[1], (void *)Mat[1], xmitlen * sizeof(double));
+		memcpy((void *)A[2], (void *)Mat[2], xmitlen * sizeof(double));
+	} else {
+		MPI_Recv((void *)A[0], xmitlen, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, &status);
+		MPI_Recv((void *)A[1], xmitlen, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, &status);
+		MPI_Recv((void *)A[2], xmitlen, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, &status);
+	}
+
+	for(j = 0; j < bw+1; j++) {
+		A[3][j] = A[0][j];
+		A[4][j] = A[2][j];
+	}
+
+	if(mynode == 1) {
+		for (i = 0; i < numrows; i++) {
+			for (j = 0; j < (bw + 1); j++) {
+				printf("%5.2f ", A[i][j]);
+			}
+			printf("\n");
+		}
+	}
 
 #else
 	const int numrows = 5;
@@ -125,6 +173,8 @@ int main(int argc, char *argv[]){
 	for(j=0;j<numactivep;j++)
 		activep[j] = j;
 
+	dbg_printf("End of part 1 @ Node %d\n", mynode);
+
 	/*
 	Remark 1: Just as in the parallel Gaussian elimination code, we augment the matrix A
 	with the right-hand-side (appending A with an extra column). This helps to minimize the
@@ -133,8 +183,10 @@ int main(int argc, char *argv[]){
 	*/
 
 	/* Part 2 - Cyclic reduction */
+#define MIN(x,y)	((x)>(y)?(y):(x))
+
 #ifdef USE_LAPACK_FORMAT
-#	define CONV_COLIDX(row_idx, col_idx)	(kl+col_idx-row_idx)
+#	define CONV_COLIDX(row_idx, col_idx)	((col_idx==size)?(bw):((row_idx==3)?(kl+col_idx-(2*mynode)):((row_idx==4)?(kl+col_idx-(2+2*mynode)):(kl+col_idx-(row_idx+2*mynode)))))
 #else
 #	define CONV_COLIDX(row_idx, col_idx)	(col_idx)
 #endif
@@ -146,6 +198,11 @@ int main(int argc, char *argv[]){
 				index2 = 2*mynode + 1 + pow(2,i);
 				alpha = A[1][CONV_COLIDX(1,index1)]/A[3][CONV_COLIDX(3,index1)];
 				gamma = A[1][CONV_COLIDX(1,index2)]/A[4][CONV_COLIDX(4,index2)];
+
+				dbg_printf("index1 = %d | index2 = %d | alpha = A[1][%d]/A[3][%d] (=%f) | gamma = A[1][%d]/A[4][%d] (=%f) @ node %d\n",
+						index1, index2,
+						CONV_COLIDX(1,index1), CONV_COLIDX(3,index1), alpha,
+						CONV_COLIDX(1,index2), CONV_COLIDX(4,index2), gamma, mynode);
 
 				for(k=0;k<size+1;k++)
 					A[1][CONV_COLIDX(1,k)] -= (alpha*A[3][CONV_COLIDX(3,k)] + gamma*A[4][CONV_COLIDX(4,k)]);
@@ -171,6 +228,8 @@ int main(int argc, char *argv[]){
 		}
 	}
 
+	dbg_printf("End of part 2 @ Node %d\n", mynode);
+
 	/*
 	Remark 2: The communication is accomplished through a series of MP I Send and MP I Recv
 	calls. Each processor is communicating (either sending or receiving) from at most two other
@@ -181,7 +240,7 @@ int main(int argc, char *argv[]){
 
 	/* Part 3 - Back substitution */
 
-	double * x = (double *)malloc(totalnodes);
+	double *x = (double *)malloc(totalnodes);
 	for(j=0;j<totalnodes;j++)
 	x[j] = 0.0;
 	if(mynode==activep[0]){
@@ -209,12 +268,15 @@ int main(int argc, char *argv[]){
 	tmp = x[mynode];
 	MPI_Allgather(&tmp,1,MPI_DOUBLE,x,1,MPI_DOUBLE, MPI_COMM_WORLD);
 
+	dbg_printf("End of part 3 @ Node %d\n", mynode);
+
 	/*
 	Remark 3: A schematic for the backward solve communication is given in figure 9.12. Notice
 	that is varies slightly from that of the forward part of the reduction. After a processor has
 	found the solution for its row and has communicated that information to the appropriate
 	processors, it is no longer active. This can be observed in figure 9.12 - observe that processor
 	P 3 no longer has things to compute in the second and third levels.
+	*/
 	/*
 	Remark 4: We use the MPI_Allgather command so that at any given level all the processors have
 	the available solution up to that point. This all inclusive communication could be
@@ -230,10 +292,19 @@ int main(int argc, char *argv[]){
 	A[0][CONV_COLIDX(0,size)] = A[0][CONV_COLIDX(0,size)]/A[0][CONV_COLIDX(0,2*mynode)];
 	A[1][CONV_COLIDX(1,size)] = x[mynode];
 	A[2][CONV_COLIDX(2,size)] = A[2][CONV_COLIDX(2,size)]/A[2][CONV_COLIDX(2,2*mynode+2)];
-	free(activep);
 
-	for(i=0;i<numrows;i++)
+	for (i = 0; i < numrows; i++) {
+		printf("A[%d][%d] = %f @ node %d\n", i, CONV_COLIDX(i,size), A[i][CONV_COLIDX(i,size)], mynode);
+	}
+
+	dbg_printf("End of part 4 @ Node %d\n", mynode);
+
+
+	free(activep);
+#if 0
+	for(i = 0; i < numrows; i++)
 		free(A[i]);
+#endif
 
 	free(A);
 	free(x);
